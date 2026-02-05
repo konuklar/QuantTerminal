@@ -51,7 +51,7 @@ except ImportError as e:
 # Additional imports for enhanced functionality
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, dendrogram
-import networkx as nx
+# import networkx as nx
 from itertools import combinations
 import base64
 from io import BytesIO
