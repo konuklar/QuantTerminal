@@ -17,27 +17,14 @@ from scipy import stats, optimize
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union
 import json
-import concurrent.futures
-from functools import lru_cache
 import traceback
-import time
-import hashlib
-import inspect
-from pathlib import Path
-import pickle
-import tempfile
 import base64
 from io import BytesIO
-import io
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # Import PyPortfolioOpt
 try:
     from pypfopt import expected_returns, risk_models
     from pypfopt.efficient_frontier import EfficientFrontier
-    from pypfopt.hierarchical_portfolio import HRPOpt
-    from pypfopt.risk_models import CovarianceShrinkage
     PYPFOPT_AVAILABLE = True
 except ImportError:
     PYPFOPT_AVAILABLE = False
@@ -48,13 +35,6 @@ try:
     QUANTSTATS_AVAILABLE = True
 except ImportError:
     QUANTSTATS_AVAILABLE = False
-
-# Import for GARCH models
-try:
-    from arch import arch_model
-    ARCH_AVAILABLE = True
-except ImportError:
-    ARCH_AVAILABLE = False
 
 # Check for scikit-learn
 try:
@@ -586,12 +566,8 @@ PORTFOLIO_STRATEGIES = {
     "Minimum Volatility": "Optimized for lowest portfolio volatility",
     "Maximum Sharpe": "Optimal risk-adjusted returns",
     "Equal Weight": "Equal allocation across all selected assets",
-    "Hierarchical Risk Parity": "Cluster-based diversification",
     "Maximum Diversification": "Maximizes diversification ratio",
-    "Black-Litterman": "Market equilibrium with investor views",
-    "Mean-Variance Optimal": "Classical Markowitz optimization",
-    "Efficient Risk": "Optimizes for maximum return at given risk level",
-    "Efficient Return": "Optimizes for minimum risk at given return target"
+    "Mean-Variance Optimal": "Classical Markowitz optimization"
 }
 
 # -------------------------------------------------------------
@@ -826,6 +802,14 @@ class RiskMetricsCalculator:
                 calmar = 0
             metrics['calmar'] = calmar
             
+            # Win rate
+            metrics['win_rate'] = len(returns[returns > 0]) / len(returns) if len(returns) > 0 else 0
+            
+            # Profit factor
+            gross_profit = returns[returns > 0].sum()
+            gross_loss = abs(returns[returns < 0].sum())
+            metrics['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else np.inf
+            
             return metrics
             
         except Exception as e:
@@ -841,66 +825,51 @@ class QuantStatsAnalytics:
     @staticmethod
     def generate_performance_report(returns: pd.Series, benchmark: pd.Series = None, 
                                    rf_rate: float = 0.03) -> Dict:
-        """Generate comprehensive performance report using QuantStats"""
+        """Generate comprehensive performance report"""
         
-        if not QUANTSTATS_AVAILABLE or returns.empty:
-            # Fallback to basic calculations
+        if returns.empty:
             return RiskMetricsCalculator.calculate_all_risk_metrics(returns)
         
         try:
-            # Calculate QuantStats metrics
-            metrics = {}
+            # Always use our own calculations for reliability
+            metrics = RiskMetricsCalculator.calculate_all_risk_metrics(returns)
             
-            # Basic metrics
-            metrics['sharpe'] = qs.stats.sharpe(returns, rf_rate)
-            metrics['sortino'] = qs.stats.sortino(returns, rf_rate)
-            metrics['calmar'] = qs.stats.calmar(returns)
-            metrics['omega'] = qs.stats.omega(returns, rf_rate)
-            metrics['cagr'] = qs.stats.cagr(returns)
+            # Add CAGR calculation
+            if len(returns) > 0:
+                total_return = (1 + returns).prod() - 1
+                years = len(returns) / 252
+                metrics['cagr'] = (1 + total_return) ** (1/years) - 1 if years > 0 else 0
             
-            # Risk metrics
-            metrics['volatility'] = qs.stats.volatility(returns)
-            metrics['value_at_risk'] = qs.stats.value_at_risk(returns)
-            metrics['conditional_var'] = qs.stats.conditional_value_at_risk(returns)
-            metrics['max_drawdown'] = qs.stats.max_drawdown(returns)
-            metrics['ulcer_index'] = qs.stats.ulcer_index(returns)
-            
-            # Statistical metrics
-            metrics['skew'] = qs.stats.skew(returns)
-            metrics['kurtosis'] = qs.stats.kurtosis(returns)
-            metrics['tail_ratio'] = qs.stats.tail_ratio(returns)
-            
-            # Benchmark-relative metrics
+            # Add benchmark metrics if available
             if benchmark is not None and not benchmark.empty:
                 aligned_returns = returns.reindex(benchmark.index).dropna()
                 aligned_benchmark = benchmark.reindex(aligned_returns.index)
                 
                 if len(aligned_returns) > 10:
-                    metrics['alpha'] = qs.stats.alpha(aligned_returns, aligned_benchmark, rf_rate)
-                    metrics['beta'] = qs.stats.beta(aligned_returns, aligned_benchmark)
-                    metrics['information_ratio'] = qs.stats.information_ratio(aligned_returns, aligned_benchmark)
-                    metrics['r_squared'] = qs.stats.r_squared(aligned_returns, aligned_benchmark)
-            
-            # Win/Loss metrics
-            metrics['win_rate'] = qs.stats.win_rate(returns)
-            metrics['profit_factor'] = qs.stats.profit_factor(returns)
-            metrics['gain_to_pain_ratio'] = qs.stats.gain_to_pain_ratio(returns)
-            
-            # Add additional VaR calculations
-            metrics['var_95_historical'] = RiskMetricsCalculator.calculate_var(returns, 0.95, 'historical')
-            metrics['var_95_parametric'] = RiskMetricsCalculator.calculate_var(returns, 0.95, 'parametric')
-            metrics['cvar_95'] = RiskMetricsCalculator.calculate_cvar(returns, 0.95)
+                    # Calculate beta
+                    covariance = np.cov(aligned_returns, aligned_benchmark)[0, 1]
+                    benchmark_variance = aligned_benchmark.var()
+                    metrics['beta'] = covariance / benchmark_variance if benchmark_variance > 0 else 0
+                    
+                    # Calculate alpha
+                    portfolio_return = aligned_returns.mean() * 252
+                    benchmark_return = aligned_benchmark.mean() * 252
+                    metrics['alpha'] = portfolio_return - rf_rate - metrics.get('beta', 0) * (benchmark_return - rf_rate)
+                    
+                    # Calculate information ratio
+                    excess_returns = aligned_returns - aligned_benchmark
+                    tracking_error = excess_returns.std() * np.sqrt(252)
+                    metrics['information_ratio'] = (excess_returns.mean() * 252) / (tracking_error + 1e-10)
             
             return metrics
             
         except Exception as e:
-            st.warning(f"QuantStats calculation error: {str(e)[:100]}")
-            # Fallback to basic risk metrics
+            st.warning(f"Performance calculation error: {str(e)[:100]}")
             return RiskMetricsCalculator.calculate_all_risk_metrics(returns)
     
     @staticmethod
     def create_performance_charts(returns: pd.Series, benchmark: pd.Series = None) -> List[go.Figure]:
-        """Create QuantStats-style performance charts"""
+        """Create performance charts"""
         
         charts = []
         
@@ -931,7 +900,7 @@ class QuantStatsAnalytics:
                 ))
             
             fig1.update_layout(
-                title="Cumulative Returns (vs Benchmark)",
+                title="Cumulative Returns",
                 height=400,
                 template="plotly_white",
                 xaxis_title="Date",
@@ -966,43 +935,9 @@ class QuantStatsAnalytics:
             )
             charts.append(fig2)
             
-            # 3. Monthly Returns Heatmap
-            if len(returns) > 60:
-                monthly_returns = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
-                monthly_returns_df = monthly_returns.reset_index()
-                monthly_returns_df['Year'] = monthly_returns_df['index'].dt.year
-                monthly_returns_df['Month'] = monthly_returns_df['index'].dt.strftime('%b')
-                
-                heatmap_data = monthly_returns_df.pivot(index='Year', columns='Month', values=0)
-                months_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
-                              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-                heatmap_data = heatmap_data.reindex(columns=months_order)
-                
-                fig3 = go.Figure(data=go.Heatmap(
-                    z=heatmap_data.values * 100,
-                    x=heatmap_data.columns,
-                    y=[str(y) for y in heatmap_data.index],
-                    colorscale='RdYlGn',
-                    zmid=0,
-                    text=heatmap_data.values,
-                    texttemplate='%{z:.1f}%',
-                    textfont={"size": 10},
-                    hovertemplate='Year: %{y}<br>Month: %{x}<br>Return: %{z:.2f}%<extra></extra>'
-                ))
-                
-                fig3.update_layout(
-                    title="Monthly Returns Heatmap",
-                    height=400,
-                    template="plotly_white",
-                    xaxis_title="Month",
-                    yaxis_title="Year",
-                    yaxis=dict(autorange="reversed")
-                )
-                charts.append(fig3)
-            
-            # 4. Return Distribution with VaR
-            fig4 = go.Figure()
-            fig4.add_trace(go.Histogram(
+            # 3. Return Distribution with VaR
+            fig3 = go.Figure()
+            fig3.add_trace(go.Histogram(
                 x=returns.values * 100,
                 nbinsx=50,
                 name="Returns",
@@ -1013,7 +948,7 @@ class QuantStatsAnalytics:
             
             # Add mean line
             mean_return = returns.mean() * 100
-            fig4.add_vline(
+            fig3.add_vline(
                 x=mean_return,
                 line_dash="dash",
                 line_color="#27ae60",
@@ -1023,7 +958,7 @@ class QuantStatsAnalytics:
             
             # Add VaR lines
             var_95 = RiskMetricsCalculator.calculate_var(returns, 0.95, 'historical') * 100
-            fig4.add_vline(
+            fig3.add_vline(
                 x=var_95,
                 line_dash="dash",
                 line_color="#e74c3c",
@@ -1031,7 +966,7 @@ class QuantStatsAnalytics:
                 annotation_position="top left"
             )
             
-            fig4.update_layout(
+            fig3.update_layout(
                 title="Return Distribution with VaR",
                 height=400,
                 template="plotly_white",
@@ -1039,156 +974,41 @@ class QuantStatsAnalytics:
                 yaxis_title="Frequency",
                 xaxis=dict(ticksuffix="%")
             )
-            charts.append(fig4)
+            charts.append(fig3)
+            
+            # 4. Rolling Sharpe Ratio
+            if len(returns) > 60:
+                window = min(60, len(returns) // 4)
+                rolling_sharpe = returns.rolling(window).mean() / returns.rolling(window).std() * np.sqrt(252)
+                
+                fig4 = go.Figure()
+                fig4.add_trace(go.Scatter(
+                    x=rolling_sharpe.index,
+                    y=rolling_sharpe.values,
+                    name="Rolling Sharpe",
+                    line=dict(color='#9b59b6', width=2)
+                ))
+                
+                fig4.update_layout(
+                    title=f"{window}-Day Rolling Sharpe Ratio",
+                    height=400,
+                    template="plotly_white",
+                    xaxis_title="Date",
+                    yaxis_title="Sharpe Ratio",
+                    hovermode='x unified'
+                )
+                charts.append(fig4)
             
         except Exception as e:
             st.warning(f"Chart generation error: {str(e)[:100]}")
         
         return charts
-    
-    @staticmethod
-    def generate_tearsheet_html(returns: pd.Series, benchmark: pd.Series = None) -> str:
-        """Generate HTML tearsheet using QuantStats"""
-        
-        if not QUANTSTATS_AVAILABLE or returns.empty:
-            return ""
-        
-        try:
-            # Create temporary file for tearsheet
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
-                temp_file = f.name
-            
-            # Generate tearsheet
-            if benchmark is not None:
-                qs.reports.html(returns, benchmark, output=temp_file)
-            else:
-                qs.reports.html(returns, output=temp_file)
-            
-            # Read the generated HTML
-            with open(temp_file, 'r') as f:
-                html_content = f.read()
-            
-            # Clean up
-            os.unlink(temp_file)
-            
-            return html_content
-            
-        except Exception as e:
-            st.warning(f"Tearsheet generation error: {str(e)[:100]}")
-            return ""
 
 # -------------------------------------------------------------
-# EWMA VOLATILITY ANALYSIS
-# -------------------------------------------------------------
-class EWMAnalysis:
-    """Exponentially Weighted Moving Average volatility analysis"""
-    
-    @staticmethod
-    def calculate_ewma_volatility(returns: pd.DataFrame, lambda_param: float = 0.94) -> pd.DataFrame:
-        """Calculate EWMA volatility for multiple assets"""
-        
-        if returns.empty:
-            return pd.DataFrame()
-        
-        ewma_vol = pd.DataFrame(index=returns.index, columns=returns.columns)
-        
-        for asset in returns.columns:
-            r = returns[asset].dropna()
-            if len(r) < 20:
-                ewma_vol[asset] = np.nan
-                continue
-            
-            try:
-                # Initialize with simple variance
-                init_window = min(30, len(r))
-                if init_window < 10:
-                    ewma_vol[asset] = r.rolling(20).std() * np.sqrt(252)
-                    continue
-                
-                init_var = r.iloc[:init_window].var()
-                
-                if pd.isna(init_var) or init_var <= 0:
-                    ewma_vol[asset] = r.rolling(20).std() * np.sqrt(252)
-                    continue
-                
-                # Calculate squared returns
-                r_squared = r ** 2
-                
-                # Recursive EWMA calculation
-                ewma_var = pd.Series(index=r.index, dtype=float)
-                ewma_var.iloc[:init_window] = init_var
-                
-                for i in range(init_window, len(r)):
-                    prev_var = ewma_var.iloc[i-1]
-                    ewma_var.iloc[i] = lambda_param * prev_var + (1 - lambda_param) * r_squared.iloc[i-1]
-                
-                # Calculate annualized volatility
-                ewma_vol[asset] = np.sqrt(ewma_var) * np.sqrt(252)
-                
-            except Exception:
-                ewma_vol[asset] = r.rolling(20).std() * np.sqrt(252)
-        
-        return ewma_vol
-    
-    @staticmethod
-    def create_ewma_charts(returns: pd.DataFrame, lambda_params: List[float] = None) -> go.Figure:
-        """Create EWMA volatility comparison charts"""
-        
-        if returns.empty or len(returns.columns) == 0:
-            return go.Figure()
-        
-        if lambda_params is None:
-            lambda_params = [0.94, 0.97, 0.99]
-        
-        # Select first asset for visualization
-        asset = returns.columns[0]
-        asset_returns = returns[asset].dropna()
-        
-        fig = go.Figure()
-        
-        # Add different lambda EWMA volatilities
-        colors = ['#1a5fb4', '#26a269', '#f39c12', '#e74c3c']
-        
-        for idx, lambda_param in enumerate(lambda_params[:4]):
-            ewma_vol = EWMAnalysis.calculate_ewma_volatility(pd.DataFrame({asset: asset_returns}), lambda_param)
-            
-            fig.add_trace(go.Scatter(
-                x=ewma_vol.index,
-                y=ewma_vol[asset],
-                name=f'EWMA λ={lambda_param}',
-                line=dict(color=colors[idx], width=2),
-                hovertemplate='Date: %{x}<br>Volatility: %{y:.2%}<extra></extra>'
-            ))
-        
-        # Add simple rolling volatility for comparison
-        rolling_vol = asset_returns.rolling(20).std() * np.sqrt(252)
-        fig.add_trace(go.Scatter(
-            x=rolling_vol.index,
-            y=rolling_vol.values,
-            name='20-Day Rolling',
-            line=dict(color='#8e44ad', width=2, dash='dash'),
-            hovertemplate='Date: %{x}<br>Volatility: %{y:.2%}<extra></extra>'
-        ))
-        
-        fig.update_layout(
-            title=f"EWMA Volatility Comparison - {asset}",
-            height=400,
-            template="plotly_white",
-            xaxis_title="Date",
-            yaxis_title="Annualized Volatility",
-            hovermode='x unified',
-            yaxis=dict(tickformat=".0%"),
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-        )
-        
-        return fig
-
-# -------------------------------------------------------------
-# ENHANCED PORTFOLIO OPTIMIZER (WITHOUT PYPFOPT DEPENDENCY)
+# ENHANCED PORTFOLIO OPTIMIZER
 # -------------------------------------------------------------
 class PortfolioOptimizer:
-    """Enhanced portfolio optimizer that works without PyPortfolioOpt"""
+    """Enhanced portfolio optimizer"""
     
     @staticmethod
     def optimize_portfolio(returns: pd.DataFrame, strategy: str, 
@@ -1498,7 +1318,7 @@ class PortfolioOptimizer:
         expected_risk = np.sqrt(weights_array @ S.values @ weights_array)
         sharpe_ratio = (expected_return - risk_free_rate) / (expected_risk + 1e-10)
         
-        # Calculate additional metrics using QuantStats or fallback
+        # Calculate additional metrics
         quantstats_metrics = QuantStatsAnalytics.generate_performance_report(
             portfolio_returns, benchmark_returns, risk_free_rate
         )
@@ -1731,9 +1551,6 @@ def main():
             
             short_selling = st.checkbox("Allow Short Selling", value=False)
             
-            # EWMA lambda
-            ewma_lambda = st.slider("EWMA Lambda", 0.80, 0.99, 0.94, 0.01)
-            
             # VaR confidence level
             var_confidence = st.slider("VaR Confidence Level (%)", 90, 99, 95, 1) / 100
         
@@ -1828,7 +1645,6 @@ def main():
                         "⚖️ Risk Analytics", 
                         "📈 Performance", 
                         "🔍 QuantStats", 
-                        "📉 EWMA/GARCH", 
                         "📋 Reports"
                     ]
                     
@@ -1847,9 +1663,6 @@ def main():
                         display_quantstats_tab(results, benchmark_returns, benchmark)
                     
                     with tabs[4]:
-                        display_volatility_tab(returns, ewma_lambda)
-                    
-                    with tabs[5]:
                         display_reports_tab(results, prices, benchmark_returns, benchmark)
                 
                 else:
@@ -2018,9 +1831,9 @@ def display_overview_tab(results: Dict, prices: pd.DataFrame, returns: pd.DataFr
             ("Calmar Ratio", metrics.get('calmar', 'N/A'), "Return vs max drawdown"),
             ("Omega Ratio", metrics.get('omega', 'N/A'), "Gain vs loss probability ratio"),
             ("CAGR", f"{metrics.get('cagr', 0):.2%}" if metrics.get('cagr') else 'N/A', "Compound annual growth rate"),
-            ("Volatility", f"{metrics.get('volatility', 0):.2%}" if metrics.get('volatility') else 'N/A', "Annualized volatility"),
-            ("Value at Risk (95%)", f"{metrics.get('value_at_risk', 0):.2%}" if metrics.get('value_at_risk') else 'N/A', "95% confidence worst loss"),
-            ("Conditional VaR (95%)", f"{metrics.get('conditional_var', 0):.2%}" if metrics.get('conditional_var') else 'N/A', "Expected shortfall"),
+            ("Volatility", f"{metrics.get('annual_volatility', 0):.2%}" if metrics.get('annual_volatility') else 'N/A', "Annualized volatility"),
+            ("Value at Risk (95%)", f"{metrics.get('var_95_historical', 0):.2%}" if metrics.get('var_95_historical') else 'N/A', "95% confidence worst loss"),
+            ("Conditional VaR (95%)", f"{metrics.get('cvar_95', 0):.2%}" if metrics.get('cvar_95') else 'N/A', "Expected shortfall"),
             ("Win Rate", f"{metrics.get('win_rate', 0):.1%}" if metrics.get('win_rate') else 'N/A', "Percentage of positive periods"),
             ("Profit Factor", f"{metrics.get('profit_factor', 'N/A')}", "Gross profit / gross loss"),
             ("Skewness", f"{metrics.get('skew', 'N/A')}", "Return distribution asymmetry"),
@@ -2053,8 +1866,8 @@ def display_risk_tab(results: Dict, returns: pd.DataFrame, var_confidence: float
         st.metric("Portfolio Volatility", f"{results['expected_risk']:.2%}")
     
     with col2:
-        if 'quantstats_metrics' in results and 'value_at_risk' in results['quantstats_metrics']:
-            var = results['quantstats_metrics']['value_at_risk']
+        if 'quantstats_metrics' in results and 'var_95_historical' in results['quantstats_metrics']:
+            var = results['quantstats_metrics']['var_95_historical']
             st.metric("VaR (95%)", f"{var:.2%}")
         else:
             # Calculate VaR directly
@@ -2063,8 +1876,8 @@ def display_risk_tab(results: Dict, returns: pd.DataFrame, var_confidence: float
             st.metric("VaR (95%)", f"{var:.2%}")
     
     with col3:
-        if 'quantstats_metrics' in results and 'conditional_var' in results['quantstats_metrics']:
-            cvar = results['quantstats_metrics']['conditional_var']
+        if 'quantstats_metrics' in results and 'cvar_95' in results['quantstats_metrics']:
+            cvar = results['quantstats_metrics']['cvar_95']
             st.metric("CVaR (95%)", f"{cvar:.2%}")
         else:
             # Calculate CVaR directly
@@ -2073,11 +1886,11 @@ def display_risk_tab(results: Dict, returns: pd.DataFrame, var_confidence: float
             st.metric("CVaR (95%)", f"{cvar:.2%}")
     
     with col4:
-        if 'quantstats_metrics' in results and 'ulcer_index' in results['quantstats_metrics']:
-            ulcer = results['quantstats_metrics']['ulcer_index']
-            st.metric("Ulcer Index", f"{ulcer:.3f}")
+        if 'quantstats_metrics' in results and 'max_drawdown' in results['quantstats_metrics']:
+            max_dd = results['quantstats_metrics']['max_drawdown']
+            st.metric("Max Drawdown", f"{max_dd:.2%}")
         else:
-            st.metric("Ulcer Index", "N/A")
+            st.metric("Max Drawdown", "N/A")
     
     # VaR Analysis Section
     st.markdown("### 📉 Value at Risk (VaR) Analysis")
@@ -2290,7 +2103,7 @@ def display_performance_tab(results: Dict, prices: pd.DataFrame,
     
     portfolio_returns = results['portfolio_returns']
     
-    # Create performance charts using QuantStats
+    # Create performance charts
     charts = QuantStatsAnalytics.create_performance_charts(portfolio_returns, benchmark_returns)
     
     for fig in charts:
@@ -2377,36 +2190,22 @@ def display_quantstats_tab(results: Dict, benchmark_returns: pd.Series, benchmar
     """, unsafe_allow_html=True)
     
     if not QUANTSTATS_AVAILABLE:
-        st.warning("QuantStats package is not installed. Install with: pip install quantstats")
-        return
+        st.warning("""
+        ⚠️ QuantStats package is not installed. 
+        
+        **To install QuantStats, run:**
+        ```bash
+        pip install quantstats
+        ```
+        
+        The application is using built-in analytics instead.
+        """)
     
     if 'portfolio_returns' not in results or results['portfolio_returns'].empty:
         st.warning("No performance data available.")
         return
     
     portfolio_returns = results['portfolio_returns']
-    
-    # Generate QuantStats tearsheet
-    st.markdown("### 📊 QuantStats Tearsheet")
-    
-    if st.button("Generate QuantStats Tearsheet", key="gen_tearsheet"):
-        with st.spinner("Generating QuantStats tearsheet..."):
-            tearsheet_html = QuantStatsAnalytics.generate_tearsheet_html(portfolio_returns, benchmark_returns)
-            
-            if tearsheet_html:
-                # Display the tearsheet
-                st.components.v1.html(tearsheet_html, height=800, scrolling=True)
-                
-                # Download button
-                st.download_button(
-                    label="📥 Download Tearsheet (HTML)",
-                    data=tearsheet_html,
-                    file_name=f"quantstats_tearsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
-                    mime="text/html",
-                    use_container_width=True
-                )
-            else:
-                st.error("Failed to generate tearsheet.")
     
     # Display advanced metrics
     st.markdown("### 📊 Advanced Performance Metrics")
@@ -2418,21 +2217,21 @@ def display_quantstats_tab(results: Dict, benchmark_returns: pd.Series, benchmar
         metric_cols = st.columns(4)
         
         advanced_metrics = [
-            ("Omega Ratio", metrics.get('omega', 'N/A'), "Probability-weighted return"),
-            ("Tail Ratio", metrics.get('tail_ratio', 'N/A'), "Right vs left tail ratio"),
-            ("Skewness", f"{metrics.get('skew', 0):.3f}" if metrics.get('skew') else 'N/A', "Return distribution asymmetry"),
-            ("Kurtosis", f"{metrics.get('kurtosis', 0):.3f}" if metrics.get('kurtosis') else 'N/A', "Fat-tailedness"),
-            ("Gain to Pain", f"{metrics.get('gain_to_pain_ratio', 0):.3f}" if metrics.get('gain_to_pain_ratio') else 'N/A', "Return vs drawdown"),
-            ("Information Ratio", f"{metrics.get('information_ratio', 0):.3f}" if metrics.get('information_ratio') else 'N/A', "Active return vs tracking error"),
-            ("Alpha", f"{metrics.get('alpha', 0):.3f}" if metrics.get('alpha') else 'N/A', "Excess return"),
-            ("Beta", f"{metrics.get('beta', 0):.3f}" if metrics.get('beta') else 'N/A', "Market sensitivity"),
+            ("Sharpe Ratio", metrics.get('sharpe', 'N/A'), "Risk-adjusted return"),
+            ("Sortino Ratio", metrics.get('sortino', 'N/A'), "Downside risk-adjusted return"),
+            ("Calmar Ratio", metrics.get('calmar', 'N/A'), "Return vs max drawdown"),
+            ("Win Rate", f"{metrics.get('win_rate', 0):.1%}" if metrics.get('win_rate') else 'N/A', "Percentage of positive periods"),
+            ("CAGR", f"{metrics.get('cagr', 0):.2%}" if metrics.get('cagr') else 'N/A', "Compound annual growth rate"),
+            ("Volatility", f"{metrics.get('annual_volatility', 0):.2%}" if metrics.get('annual_volatility') else 'N/A', "Annualized volatility"),
+            ("Max Drawdown", f"{metrics.get('max_drawdown', 0):.2%}" if metrics.get('max_drawdown') else 'N/A', "Maximum peak-to-trough decline"),
+            ("VaR (95%)", f"{metrics.get('var_95_historical', 0):.2%}" if metrics.get('var_95_historical') else 'N/A', "Value at Risk"),
         ]
         
         for i, (name, value, desc) in enumerate(advanced_metrics):
             with metric_cols[i % 4]:
                 st.metric(name, value, help=desc)
         
-        # Performance comparison
+        # Performance comparison gauges
         st.markdown("### 📈 Performance Comparison")
         
         col1, col2 = st.columns(2)
@@ -2463,21 +2262,21 @@ def display_quantstats_tab(results: Dict, benchmark_returns: pd.Series, benchmar
                 st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            if 'profit_factor' in metrics:
-                profit_factor = float(metrics['profit_factor']) if metrics['profit_factor'] != 'N/A' else 1.0
+            if 'sharpe' in metrics:
+                sharpe = float(metrics['sharpe']) if metrics['sharpe'] != 'N/A' else 0
                 
                 fig = go.Figure(data=[go.Indicator(
                     mode="gauge+number",
-                    value=profit_factor,
-                    title={'text': "Profit Factor"},
+                    value=sharpe,
+                    title={'text': "Sharpe Ratio"},
                     domain={'x': [0, 1], 'y': [0, 1]},
                     gauge={
-                        'axis': {'range': [0, max(5, profit_factor * 1.5)]},
+                        'axis': {'range': [0, max(3, sharpe * 1.5)]},
                         'bar': {'color': "#3498db"},
                         'steps': [
                             {'range': [0, 1], 'color': "lightgray"},
                             {'range': [1, 2], 'color': "lightgreen"},
-                            {'range': [2, 5], 'color': "lightblue"}
+                            {'range': [2, 3], 'color': "lightblue"}
                         ],
                         'threshold': {
                             'line': {'color': "red", 'width': 4},
@@ -2489,134 +2288,32 @@ def display_quantstats_tab(results: Dict, benchmark_returns: pd.Series, benchmar
                 
                 fig.update_layout(height=300)
                 st.plotly_chart(fig, use_container_width=True)
-
-def display_volatility_tab(returns: pd.DataFrame, ewma_lambda: float):
-    """Display volatility analysis tab"""
-    
-    st.markdown("""
-    <div style="background: linear-gradient(90deg, #f39c12, #f1c40f); 
-                padding: 1.5rem; border-radius: 10px; margin-bottom: 2rem;">
-        <h2 style="color: white; margin: 0;">📉 VOLATILITY ANALYTICS</h2>
-        <p style="color: rgba(255,255,255,0.9); margin: 0;">EWMA & GARCH Volatility Models</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    if returns.empty:
-        st.warning("No returns data available.")
-        return
-    
-    # EWMA Analysis
-    st.markdown("### 📊 EWMA Volatility Analysis")
-    
-    # Select asset for volatility analysis
-    selected_asset = st.selectbox(
-        "Select Asset for Volatility Analysis",
-        returns.columns,
-        key="vol_asset_select"
-    )
-    
-    if selected_asset:
-        asset_returns = returns[selected_asset].dropna()
         
-        # EWMA chart
-        st.markdown(f"#### EWMA Volatility - {selected_asset}")
-        
-        ewma_fig = EWMAnalysis.create_ewma_charts(
-            pd.DataFrame({selected_asset: asset_returns}), 
-            lambda_params=[ewma_lambda, 0.97, 0.99]
-        )
-        st.plotly_chart(ewma_fig, use_container_width=True)
-        
-        # Volatility clustering visualization
-        st.markdown("#### Volatility Clustering")
-        
-        fig = go.Figure()
-        
-        # Add returns
-        fig.add_trace(go.Scatter(
-            x=asset_returns.index,
-            y=asset_returns.values * 100,
-            name="Returns",
-            line=dict(color='#1a5fb4', width=1),
-            opacity=0.7,
-            hovertemplate='Date: %{x}<br>Return: %{y:.2f}%<extra></extra>'
-        ))
-        
-        # Add EWMA volatility bands
-        ewma_vol = EWMAnalysis.calculate_ewma_volatility(
-            pd.DataFrame({selected_asset: asset_returns}), 
-            lambda_param=ewma_lambda
-        )
-        
-        if not ewma_vol.empty:
-            vol_values = ewma_vol[selected_asset].dropna() / np.sqrt(252) * 100  # Daily percentage
+        # Benchmark metrics if available
+        if benchmark_returns is not None and not benchmark_returns.empty:
+            st.markdown("### 📊 Benchmark Metrics")
             
-            # Upper band (mean + 2*std)
-            fig.add_trace(go.Scatter(
-                x=vol_values.index,
-                y=vol_values.values * 2,
-                name="+2σ Band",
-                line=dict(color='#e74c3c', width=1, dash='dot'),
-                opacity=0.5,
-                fill=None
-            ))
+            benchmark_cols = st.columns(4)
             
-            # Lower band (mean - 2*std)
-            fig.add_trace(go.Scatter(
-                x=vol_values.index,
-                y=vol_values.values * -2,
-                name="-2σ Band",
-                line=dict(color='#2ecc71', width=1, dash='dot'),
-                opacity=0.5,
-                fill='tonexty',
-                fillcolor='rgba(231, 76, 60, 0.1)'
-            ))
-        
-        fig.update_layout(
-            title="Returns with Volatility Bands",
-            height=400,
-            template="plotly_white",
-            xaxis_title="Date",
-            yaxis_title="Daily Return (%)",
-            hovermode='x unified',
-            yaxis=dict(ticksuffix="%")
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Rolling volatility comparison
-    st.markdown("### 📈 Rolling Volatility Comparison")
-    
-    if len(returns.columns) >= 2:
-        # Calculate rolling volatility for all assets
-        window = st.slider("Rolling Window (days)", 20, 252, 63, key="vol_window")
-        
-        rolling_vols = pd.DataFrame()
-        for asset in returns.columns[:5]:  # Limit to first 5 assets
-            rolling_vols[asset] = returns[asset].rolling(window).std() * np.sqrt(252)
-        
-        fig = go.Figure()
-        
-        for asset in rolling_vols.columns:
-            fig.add_trace(go.Scatter(
-                x=rolling_vols.index,
-                y=rolling_vols[asset],
-                name=asset,
-                mode='lines',
-                hovertemplate=f'{asset}<br>Date: %{{x}}<br>Vol: %{{y:.2%}}<extra></extra>'
-            ))
-        
-        fig.update_layout(
-            title=f"{window}-Day Rolling Volatility",
-            height=400,
-            template="plotly_white",
-            xaxis_title="Date",
-            yaxis_title="Annualized Volatility",
-            hovermode='x unified',
-            yaxis=dict(tickformat=".1%")
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+            with benchmark_cols[0]:
+                if 'benchmark_metrics' in results and 'alpha' in results['benchmark_metrics']:
+                    alpha = results['benchmark_metrics']['alpha']
+                    st.metric("Alpha", f"{alpha:.2%}", help="Excess return over benchmark")
+            
+            with benchmark_cols[1]:
+                if 'benchmark_metrics' in results and 'beta' in results['benchmark_metrics']:
+                    beta = results['benchmark_metrics']['beta']
+                    st.metric("Beta", f"{beta:.2f}", help="Market sensitivity")
+            
+            with benchmark_cols[2]:
+                if 'benchmark_metrics' in results and 'information_ratio' in results['benchmark_metrics']:
+                    ir = results['benchmark_metrics']['information_ratio']
+                    st.metric("Info Ratio", f"{ir:.2f}", help="Active return vs tracking error")
+            
+            with benchmark_cols[3]:
+                if 'benchmark_metrics' in results and 'tracking_error' in results['benchmark_metrics']:
+                    te = results['benchmark_metrics']['tracking_error']
+                    st.metric("Tracking Error", f"{te:.2%}", help="Volatility of excess returns")
 
 def display_reports_tab(results: Dict, prices: pd.DataFrame, 
                        benchmark_returns: pd.Series, benchmark: str):
@@ -2651,7 +2348,8 @@ def display_reports_tab(results: Dict, prices: pd.DataFrame,
         returns_df = results['portfolio_returns'].to_frame(name='Portfolio_Returns')
         
         # Remove timezone info for Excel compatibility
-        returns_df.index = returns_df.index.tz_localize(None)
+        if returns_df.index.tz is not None:
+            returns_df.index = returns_df.index.tz_localize(None)
         
         col1, col2 = st.columns(2)
         
@@ -2689,7 +2387,8 @@ def display_reports_tab(results: Dict, prices: pd.DataFrame,
                 # Benchmark comparison
                 if benchmark_returns is not None and not benchmark_returns.empty:
                     benchmark_df = benchmark_returns.to_frame(name=f'{benchmark}_Returns')
-                    benchmark_df.index = benchmark_df.index.tz_localize(None)
+                    if benchmark_df.index.tz is not None:
+                        benchmark_df.index = benchmark_df.index.tz_localize(None)
                     benchmark_df.to_excel(writer, sheet_name='Benchmark Returns')
             
             st.download_button(
@@ -2714,8 +2413,8 @@ def display_reports_tab(results: Dict, prices: pd.DataFrame,
             return_metrics = [
                 ("Annual Return", f"{results.get('expected_return', 0):.2%}"),
                 ("CAGR", f"{metrics.get('cagr', 0):.2%}" if metrics.get('cagr') else 'N/A'),
-                ("Best Month", f"{metrics.get('best_month', 0):.2%}" if metrics.get('best_month') else 'N/A'),
-                ("Worst Month", f"{metrics.get('worst_month', 0):.2%}" if metrics.get('worst_month') else 'N/A'),
+                ("Sharpe Ratio", f"{results.get('sharpe_ratio', 0):.2f}"),
+                ("Alpha", f"{results.get('benchmark_metrics', {}).get('alpha', 0):.2%}" if 'benchmark_metrics' in results else 'N/A'),
             ]
             
             for name, value in return_metrics:
@@ -2727,8 +2426,8 @@ def display_reports_tab(results: Dict, prices: pd.DataFrame,
             risk_metrics = [
                 ("Annual Volatility", f"{results.get('expected_risk', 0):.2%}"),
                 ("Max Drawdown", f"{metrics.get('max_drawdown', 0):.2%}" if metrics.get('max_drawdown') else 'N/A'),
-                ("Sharpe Ratio", f"{results.get('sharpe_ratio', 0):.2f}"),
-                ("Sortino Ratio", f"{metrics.get('sortino', 0):.2f}" if metrics.get('sortino') else 'N/A'),
+                ("VaR (95%)", f"{metrics.get('var_95_historical', 0):.2%}" if metrics.get('var_95_historical') else 'N/A'),
+                ("CVaR (95%)", f"{metrics.get('cvar_95', 0):.2%}" if metrics.get('cvar_95') else 'N/A'),
             ]
             
             for name, value in risk_metrics:
@@ -2738,8 +2437,8 @@ def display_reports_tab(results: Dict, prices: pd.DataFrame,
             st.markdown("#### Ratios")
             
             ratio_metrics = [
+                ("Sortino Ratio", f"{metrics.get('sortino', 0):.2f}" if metrics.get('sortino') else 'N/A'),
                 ("Calmar Ratio", f"{metrics.get('calmar', 0):.2f}" if metrics.get('calmar') else 'N/A'),
-                ("Omega Ratio", f"{metrics.get('omega', 0):.2f}" if metrics.get('omega') else 'N/A'),
                 ("Win Rate", f"{metrics.get('win_rate', 0):.1%}" if metrics.get('win_rate') else 'N/A'),
                 ("Profit Factor", f"{metrics.get('profit_factor', 'N/A')}"),
             ]
@@ -2839,19 +2538,16 @@ def generate_risk_report(results: Dict):
             #### Volatility Metrics
             - **Annual Volatility**: {results.get('expected_risk', 0):.2%}
             - **Daily Volatility**: {results.get('expected_risk', 0) / np.sqrt(252):.2%}
-            - **Rolling Volatility (63-day)**: Calculated
             
             #### Downside Risk
             - **Maximum Drawdown**: {results.get('quantstats_metrics', {}).get('max_drawdown', 0):.2%}
-            - **Value at Risk (95%)**: {results.get('quantstats_metrics', {}).get('value_at_risk', 0):.2%}
-            - **Conditional VaR (95%)**: {results.get('quantstats_metrics', {}).get('conditional_var', 0):.2%}
-            - **Ulcer Index**: {results.get('quantstats_metrics', {}).get('ulcer_index', 0):.3f}
+            - **Value at Risk (95%)**: {results.get('quantstats_metrics', {}).get('var_95_historical', 0):.2%}
+            - **Conditional VaR (95%)**: {results.get('quantstats_metrics', {}).get('cvar_95', 0):.2%}
             
             #### VaR Analysis (95% Confidence)
             - **Historical VaR**: {results.get('quantstats_metrics', {}).get('var_95_historical', 0):.2%}
             - **Parametric VaR**: {results.get('quantstats_metrics', {}).get('var_95_parametric', 0):.2%}
             - **Cornish-Fisher VaR**: {results.get('quantstats_metrics', {}).get('var_95_cornish_fisher', 0):.2%}
-            - **Conditional VaR**: {results.get('quantstats_metrics', {}).get('cvar_95', 0):.2%}
             
             #### Diversification Metrics
             - **Diversification Ratio**: {results.get('diversification_ratio', 0):.2f}
@@ -2860,7 +2556,6 @@ def generate_risk_report(results: Dict):
             #### Statistical Metrics
             - **Skewness**: {results.get('quantstats_metrics', {}).get('skew', 0):.3f}
             - **Kurtosis**: {results.get('quantstats_metrics', {}).get('kurtosis', 0):.3f}
-            - **Tail Ratio**: {results.get('quantstats_metrics', {}).get('tail_ratio', 0):.3f}
             
             ### Risk Management Recommendations
             1. Monitor correlation levels between assets
@@ -2905,9 +2600,6 @@ def check_dependencies():
     if not QUANTSTATS_AVAILABLE:
         missing_deps.append("QuantStats")
     
-    if not ARCH_AVAILABLE:
-        missing_deps.append("ARCH")
-    
     if missing_deps:
         st.warning(f"""
         ⚠️ **Missing Dependencies Detected**
@@ -2917,7 +2609,7 @@ def check_dependencies():
         
         **To install all dependencies, run:**
         ```bash
-        pip install scikit-learn pypfopt quantstats arch
+        pip install scikit-learn pypfopt quantstats
         ```
         
         The application will run with built-in optimization algorithms.
@@ -2963,8 +2655,8 @@ def display_welcome_screen():
         ("📊 Portfolio Optimization", "Advanced optimization algorithms for optimal asset allocation"),
         ("⚖️ Risk Analytics", "Comprehensive risk metrics including VaR, CVaR, and drawdown analysis"),
         ("📈 Performance Analysis", "Detailed performance attribution and benchmarking"),
-        ("🔍 Quantitative Analytics", "QuantStats integration for professional-grade analytics"),
-        ("📉 Volatility Modeling", "EWMA and GARCH models for volatility forecasting"),
+        ("🔍 Quantitative Analytics", "Professional-grade analytics and metrics"),
+        ("📉 Risk Modeling", "Advanced VaR calculations and risk decomposition"),
         ("📋 Institutional Reports", "Professional reporting and data export capabilities")
     ]
     
@@ -2976,23 +2668,6 @@ def display_welcome_screen():
                 <p style="color: var(--text-muted); font-size: 0.9rem;">{description}</p>
             </div>
             """, unsafe_allow_html=True)
-    
-    # Recent performance (placeholder)
-    st.markdown("### 📈 Recent Market Overview")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("S&P 500", "4,567.89", "+1.23%")
-    
-    with col2:
-        st.metric("NASDAQ", "14,234.56", "+2.34%")
-    
-    with col3:
-        st.metric("10Y Treasury", "4.12%", "-0.05%")
-    
-    with col4:
-        st.metric("Gold", "$1,978.45", "+0.78%")
     
     # Footer
     st.markdown("---")
