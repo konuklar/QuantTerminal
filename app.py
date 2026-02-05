@@ -56,6 +56,13 @@ try:
 except ImportError:
     ARCH_AVAILABLE = False
 
+# Check for scikit-learn
+try:
+    import sklearn
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 warnings.filterwarnings("ignore")
 
 # -------------------------------------------------------------
@@ -1150,10 +1157,10 @@ class GARCHAnalysis:
         return fig
 
 # -------------------------------------------------------------
-# ENHANCED PORTFOLIO OPTIMIZER
+# ENHANCED PORTFOLIO OPTIMIZER (WITHOUT PYPFOPT DEPENDENCY)
 # -------------------------------------------------------------
 class PortfolioOptimizer:
-    """Enhanced portfolio optimizer with PyPortfolioOpt"""
+    """Enhanced portfolio optimizer that works without PyPortfolioOpt"""
     
     @staticmethod
     def optimize_portfolio(returns: pd.DataFrame, strategy: str, 
@@ -1162,9 +1169,6 @@ class PortfolioOptimizer:
         """Optimize portfolio using specified strategy"""
         
         if returns.empty or len(returns.columns) < 2:
-            return PortfolioOptimizer._equal_weight_fallback(returns)
-        
-        if not PYPFOPT_AVAILABLE:
             return PortfolioOptimizer._equal_weight_fallback(returns)
         
         # Default constraints
@@ -1177,93 +1181,314 @@ class PortfolioOptimizer:
         
         try:
             # Calculate expected returns and covariance
-            mu = expected_returns.mean_historical_return(returns)
-            S = CovarianceShrinkage(returns).ledoit_wolf()
-            
-            # Create efficient frontier
-            weight_bounds = (0, 1) if not constraints.get('short_selling', False) else (-1, 1)
-            ef = EfficientFrontier(mu, S, weight_bounds=weight_bounds)
-            
-            # Apply weight constraints
-            if constraints.get('max_weight') is not None:
-                ef.add_constraint(lambda w: w <= constraints['max_weight'])
-            if constraints.get('min_weight') is not None:
-                ef.add_constraint(lambda w: w >= constraints['min_weight'])
+            mu = returns.mean() * 252  # Annualized returns
+            S = returns.cov() * 252    # Annualized covariance
             
             # Strategy-specific optimization
             weights = None
             
             if strategy == "Minimum Volatility":
-                weights = ef.min_volatility()
+                weights = PortfolioOptimizer._min_volatility_optimization(S)
             elif strategy == "Maximum Sharpe":
-                weights = ef.max_sharpe(risk_free_rate=risk_free_rate/252)
+                weights = PortfolioOptimizer._max_sharpe_optimization(mu, S, risk_free_rate)
             elif strategy == "Risk Parity":
-                # Simple risk parity implementation
-                volatilities = returns.std() * np.sqrt(252)
-                inv_vol = 1 / (volatilities + 1e-10)
-                weights_raw = inv_vol / inv_vol.sum()
-                weights = {asset: weights_raw[asset] for asset in returns.columns}
-            elif strategy == "Hierarchical Risk Parity":
-                hrp = HRPOpt(returns)
-                weights = hrp.optimize()
+                weights = PortfolioOptimizer._risk_parity_optimization(returns)
+            elif strategy == "Equal Weight":
+                weights = PortfolioOptimizer._equal_weight_optimization(returns)
+            elif strategy == "Institutional Balanced":
+                weights = PortfolioOptimizer._institutional_balanced(returns.columns)
             elif strategy == "Maximum Diversification":
-                # Max diversification approximation
-                volatilities = returns.std() * np.sqrt(252)
-                weights_raw = 1 / (volatilities + 1e-10)
-                weights_raw = weights_raw / weights_raw.sum()
-                weights = {asset: weights_raw[asset] for asset in returns.columns}
-            else:  # Equal Weight or fallback
-                n_assets = len(returns.columns)
-                weights = {asset: 1.0/n_assets for asset in returns.columns}
-            
-            # Clean weights
-            if isinstance(weights, dict):
-                cleaned_weights = ef.clean_weights() if hasattr(ef, 'clean_weights') else weights
+                weights = PortfolioOptimizer._max_diversification_optimization(S)
             else:
-                cleaned_weights = ef.clean_weights()
+                # Fallback to equal weights
+                weights = PortfolioOptimizer._equal_weight_optimization(returns)
             
-            # Calculate performance
-            if hasattr(ef, 'portfolio_performance'):
-                expected_return, expected_risk, sharpe_ratio = ef.portfolio_performance(
-                    risk_free_rate=risk_free_rate/252
-                )
-            else:
-                # Fallback calculation
-                weights_array = np.array([cleaned_weights.get(asset, 0) for asset in returns.columns])
-                portfolio_returns = (returns * weights_array).sum(axis=1)
-                expected_return = portfolio_returns.mean() * 252
-                expected_risk = portfolio_returns.std() * np.sqrt(252)
-                sharpe_ratio = (expected_return - risk_free_rate) / (expected_risk + 1e-10)
+            # Apply constraints
+            weights = PortfolioOptimizer._apply_constraints(weights, constraints)
             
-            # Calculate portfolio returns
-            weights_array = np.array([cleaned_weights.get(asset, 0) for asset in returns.columns])
-            portfolio_returns = (returns * weights_array).sum(axis=1)
-            
-            # Calculate additional metrics using QuantStats
-            quantstats_metrics = QuantStatsAnalytics.generate_performance_report(portfolio_returns)
-            
-            # Calculate diversification metrics
-            corr_matrix = returns.corr()
-            portfolio_variance = weights_array.T @ S.values @ weights_array
-            weighted_vol = np.sqrt(np.diag(S.values)) @ weights_array
-            diversification_ratio = weighted_vol / np.sqrt(portfolio_variance) if portfolio_variance > 0 else 1
-            
-            return {
-                'weights': cleaned_weights,
-                'weights_array': weights_array,
-                'expected_return': expected_return,
-                'expected_risk': expected_risk,
-                'sharpe_ratio': sharpe_ratio,
-                'portfolio_returns': portfolio_returns,
-                'quantstats_metrics': quantstats_metrics,
-                'diversification_ratio': diversification_ratio,
-                'avg_correlation': corr_matrix.values[np.triu_indices_from(corr_matrix.values, k=1)].mean(),
-                'success': True
-            }
+            # Calculate portfolio metrics
+            return PortfolioOptimizer._calculate_portfolio_metrics(weights, returns, mu, S, risk_free_rate)
             
         except Exception as e:
             st.error(f"Optimization error: {str(e)[:200]}")
             return PortfolioOptimizer._equal_weight_fallback(returns)
+    
+    @staticmethod
+    def _min_volatility_optimization(S: pd.DataFrame) -> Dict:
+        """Minimum volatility optimization"""
+        try:
+            n = len(S)
+            
+            # Objective function: w'Σw
+            def objective(w):
+                return w @ S.values @ w
+            
+            # Constraints: sum(w) = 1
+            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+            
+            # Bounds: no short selling
+            bounds = [(0, 1) for _ in range(n)]
+            
+            # Initial guess (equal weights)
+            w0 = np.ones(n) / n
+            
+            # Optimize
+            result = optimize.minimize(
+                objective, w0, method='SLSQP',
+                bounds=bounds, constraints=constraints
+            )
+            
+            if result.success:
+                weights = {asset: result.x[i] for i, asset in enumerate(S.index)}
+                return weights
+            else:
+                raise Exception("Optimization failed")
+                
+        except Exception:
+            # Fallback to inverse volatility
+            return PortfolioOptimizer._inverse_volatility_weights(S)
+    
+    @staticmethod
+    def _max_sharpe_optimization(mu: pd.Series, S: pd.DataFrame, risk_free_rate: float) -> Dict:
+        """Maximum Sharpe ratio optimization"""
+        try:
+            n = len(S)
+            
+            # Objective: minimize -Sharpe ratio = -(μ'w - rf)/sqrt(w'Σw)
+            def objective(w):
+                portfolio_return = mu.values @ w
+                portfolio_risk = np.sqrt(w @ S.values @ w)
+                sharpe = (portfolio_return - risk_free_rate) / (portfolio_risk + 1e-10)
+                return -sharpe  # Minimize negative Sharpe = maximize Sharpe
+            
+            # Constraints: sum(w) = 1
+            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+            
+            # Bounds: no short selling
+            bounds = [(0, 1) for _ in range(n)]
+            
+            # Initial guess (equal weights)
+            w0 = np.ones(n) / n
+            
+            # Optimize
+            result = optimize.minimize(
+                objective, w0, method='SLSQP',
+                bounds=bounds, constraints=constraints
+            )
+            
+            if result.success:
+                weights = {asset: result.x[i] for i, asset in enumerate(S.index)}
+                return weights
+            else:
+                raise Exception("Optimization failed")
+                
+        except Exception:
+            # Fallback to mean-variance with regularization
+            return PortfolioOptimizer._regularized_mean_variance(mu, S)
+    
+    @staticmethod
+    def _risk_parity_optimization(returns: pd.DataFrame) -> Dict:
+        """Risk parity optimization"""
+        try:
+            # Simple risk parity: weights inversely proportional to volatility
+            volatilities = returns.std() * np.sqrt(252)
+            inv_vol = 1 / (volatilities + 1e-10)
+            weights_raw = inv_vol / inv_vol.sum()
+            weights = {asset: weights_raw[asset] for asset in returns.columns}
+            return weights
+        except Exception:
+            return PortfolioOptimizer._equal_weight_optimization(returns)
+    
+    @staticmethod
+    def _max_diversification_optimization(S: pd.DataFrame) -> Dict:
+        """Maximum diversification optimization"""
+        try:
+            n = len(S)
+            volatilities = np.sqrt(np.diag(S.values))
+            
+            # Objective: maximize diversification ratio
+            def objective(w):
+                weighted_vol = volatilities @ w
+                portfolio_risk = np.sqrt(w @ S.values @ w)
+                diversification = weighted_vol / (portfolio_risk + 1e-10)
+                return -diversification  # Minimize negative diversification
+            
+            # Constraints: sum(w) = 1
+            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+            
+            # Bounds: no short selling
+            bounds = [(0, 1) for _ in range(n)]
+            
+            # Initial guess (equal weights)
+            w0 = np.ones(n) / n
+            
+            # Optimize
+            result = optimize.minimize(
+                objective, w0, method='SLSQP',
+                bounds=bounds, constraints=constraints
+            )
+            
+            if result.success:
+                weights = {asset: result.x[i] for i, asset in enumerate(S.index)}
+                return weights
+            else:
+                raise Exception("Optimization failed")
+                
+        except Exception:
+            return PortfolioOptimizer._inverse_volatility_weights(S)
+    
+    @staticmethod
+    def _institutional_balanced(assets: List[str]) -> Dict:
+        """Institutional balanced allocation (40/40/20 rule)"""
+        weights = {}
+        
+        # Categorize assets
+        equity_etfs = ['SPY', 'QQQ', 'IWM', 'VTI', 'VOO', 'IVV', 'XLK', 'XLV', 'XLF', 'XLE', 'XLI', 'XLP', 'XLY', 'XLU']
+        bond_etfs = ['TLT', 'IEF', 'SHY', 'BND', 'AGG', 'LQD', 'TIP', 'MUB']
+        alternative_etfs = ['GLD', 'SLV', 'USO', 'DBA', 'PDBC', 'GSG', 'VNQ', 'IYR', 'REM']
+        
+        equity_count = sum(1 for asset in assets if asset in equity_etfs)
+        bond_count = sum(1 for asset in assets if asset in bond_etfs)
+        alt_count = sum(1 for asset in assets if asset in alternative_etfs)
+        
+        total_categorized = equity_count + bond_count + alt_count
+        
+        if total_categorized > 0:
+            for asset in assets:
+                if asset in equity_etfs:
+                    weights[asset] = 0.4 / equity_count if equity_count > 0 else 0
+                elif asset in bond_etfs:
+                    weights[asset] = 0.4 / bond_count if bond_count > 0 else 0
+                elif asset in alternative_etfs:
+                    weights[asset] = 0.2 / alt_count if alt_count > 0 else 0
+                else:
+                    weights[asset] = 0
+        else:
+            # Fallback to equal weights
+            n = len(assets)
+            weights = {asset: 1.0/n for asset in assets}
+        
+        # Normalize
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v/total for k, v in weights.items()}
+        
+        return weights
+    
+    @staticmethod
+    def _inverse_volatility_weights(S: pd.DataFrame) -> Dict:
+        """Inverse volatility weighting"""
+        volatilities = np.sqrt(np.diag(S.values))
+        inv_vol = 1 / (volatilities + 1e-10)
+        weights_raw = inv_vol / inv_vol.sum()
+        weights = {asset: weights_raw[i] for i, asset in enumerate(S.index)}
+        return weights
+    
+    @staticmethod
+    def _regularized_mean_variance(mu: pd.Series, S: pd.DataFrame) -> Dict:
+        """Regularized mean-variance optimization"""
+        n = len(S)
+        gamma = 0.5  # Regularization parameter
+        
+        # Objective: maximize μ'w - γ * w'Σw
+        def objective(w):
+            return -(mu.values @ w - gamma * (w @ S.values @ w))
+        
+        # Constraints: sum(w) = 1
+        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+        
+        # Bounds: no short selling
+        bounds = [(0, 1) for _ in range(n)]
+        
+        # Initial guess (equal weights)
+        w0 = np.ones(n) / n
+        
+        # Optimize
+        result = optimize.minimize(
+            objective, w0, method='SLSQP',
+            bounds=bounds, constraints=constraints
+        )
+        
+        if result.success:
+            weights = {asset: result.x[i] for i, asset in enumerate(S.index)}
+            return weights
+        else:
+            return PortfolioOptimizer._equal_weight_optimization(pd.DataFrame(columns=S.index))
+    
+    @staticmethod
+    def _equal_weight_optimization(returns: pd.DataFrame) -> Dict:
+        """Equal weight optimization"""
+        n = len(returns.columns)
+        weights = {asset: 1.0/n for asset in returns.columns}
+        return weights
+    
+    @staticmethod
+    def _apply_constraints(weights: Dict, constraints: Dict) -> Dict:
+        """Apply weight constraints"""
+        max_weight = constraints.get('max_weight', 1.0)
+        min_weight = constraints.get('min_weight', 0.0)
+        short_selling = constraints.get('short_selling', False)
+        
+        # Normalize weights
+        weight_sum = sum(weights.values())
+        if weight_sum == 0:
+            return weights
+        
+        normalized_weights = {}
+        for asset, weight in weights.items():
+            # Apply min/max bounds
+            if not short_selling:
+                weight = max(min_weight, min(max_weight, weight))
+            normalized_weights[asset] = weight
+        
+        # Renormalize
+        total_weight = sum(normalized_weights.values())
+        if total_weight > 0:
+            normalized_weights = {k: v/total_weight for k, v in normalized_weights.items()}
+        
+        return normalized_weights
+    
+    @staticmethod
+    def _calculate_portfolio_metrics(weights: Dict, returns: pd.DataFrame, 
+                                    mu: pd.Series, S: pd.DataFrame, 
+                                    risk_free_rate: float) -> Dict:
+        """Calculate portfolio performance metrics"""
+        
+        # Convert weights to array
+        assets = list(weights.keys())
+        weights_array = np.array([weights[asset] for asset in assets])
+        
+        # Calculate portfolio returns
+        portfolio_returns = (returns[assets] * weights_array).sum(axis=1)
+        
+        # Calculate performance metrics
+        expected_return = mu.values @ weights_array
+        expected_risk = np.sqrt(weights_array @ S.values @ weights_array)
+        sharpe_ratio = (expected_return - risk_free_rate) / (expected_risk + 1e-10)
+        
+        # Calculate additional metrics
+        quantstats_metrics = {}
+        if QUANTSTATS_AVAILABLE and not portfolio_returns.empty:
+            quantstats_metrics = QuantStatsAnalytics.generate_performance_report(portfolio_returns)
+        
+        # Calculate diversification metrics
+        corr_matrix = returns[assets].corr()
+        portfolio_variance = weights_array @ S.values @ weights_array
+        weighted_vol = np.sqrt(np.diag(S.values)) @ weights_array
+        diversification_ratio = weighted_vol / np.sqrt(portfolio_variance) if portfolio_variance > 0 else 1
+        
+        return {
+            'weights': weights,
+            'weights_array': weights_array,
+            'expected_return': expected_return,
+            'expected_risk': expected_risk,
+            'sharpe_ratio': sharpe_ratio,
+            'portfolio_returns': portfolio_returns,
+            'quantstats_metrics': quantstats_metrics,
+            'diversification_ratio': diversification_ratio,
+            'avg_correlation': corr_matrix.values[np.triu_indices_from(corr_matrix.values, k=1)].mean(),
+            'success': True
+        }
     
     @staticmethod
     def _equal_weight_fallback(returns: pd.DataFrame) -> Dict:
@@ -1285,11 +1510,15 @@ class PortfolioOptimizer:
         weights_array = np.ones(n_assets) / n_assets
         
         portfolio_returns = (returns * weights_array).sum(axis=1)
-        expected_return = portfolio_returns.mean() * 252
-        expected_risk = portfolio_returns.std() * np.sqrt(252)
+        mu = returns.mean() * 252
+        S = returns.cov() * 252
+        expected_return = mu.values @ weights_array
+        expected_risk = np.sqrt(weights_array @ S.values @ weights_array)
         sharpe_ratio = (expected_return - 0.03) / (expected_risk + 1e-10)
         
-        quantstats_metrics = QuantStatsAnalytics.generate_performance_report(portfolio_returns)
+        quantstats_metrics = {}
+        if QUANTSTATS_AVAILABLE and not portfolio_returns.empty:
+            quantstats_metrics = QuantStatsAnalytics.generate_performance_report(portfolio_returns)
         
         return {
             'weights': equal_weights,
@@ -1309,6 +1538,11 @@ class PortfolioOptimizer:
 # -------------------------------------------------------------
 def main():
     """Main application with enhanced features"""
+    
+    # Check dependencies
+    if 'deps_checked' not in st.session_state:
+        check_dependencies()
+        st.session_state.deps_checked = True
     
     # Custom header
     st.markdown("""
@@ -1452,9 +1686,11 @@ def main():
         with col1:
             st.metric("Assets", len(selected_assets))
         with col2:
-            st.metric("PyPortfolioOpt", "✅" if PYPFOPT_AVAILABLE else "❌")
+            status = "✅" if PYPFOPT_AVAILABLE else "⚠️"
+            st.metric("Optimizer", status)
         with col3:
-            st.metric("QuantStats", "✅" if QUANTSTATS_AVAILABLE else "❌")
+            status = "✅" if QUANTSTATS_AVAILABLE else "⚠️"
+            st.metric("Analytics", status)
     
     # Main content
     if run_analysis and len(selected_assets) >= 3:
@@ -1529,6 +1765,8 @@ def main():
                     
             except Exception as e:
                 st.error(f"❌ Analysis error: {str(e)[:200]}")
+                with st.expander("Error Details"):
+                    st.code(traceback.format_exc())
     
     else:
         display_welcome_screen()
@@ -1933,7 +2171,6 @@ def display_quantstats_tab(results: Dict):
                 st.error("Failed to generate tearsheet.")
     
     # Display advanced metrics
-        # Display advanced metrics
     st.markdown("### 📊 Advanced Performance Metrics")
     
     if 'quantstats_metrics' in results and results['quantstats_metrics']:
@@ -2451,6 +2688,40 @@ def get_asset_category(ticker: str) -> str:
         if ticker in data["assets"]:
             return category
     return "Unknown"
+
+def check_dependencies():
+    """Check if all required dependencies are installed"""
+    
+    missing_deps = []
+    
+    if not SKLEARN_AVAILABLE:
+        missing_deps.append("scikit-learn")
+    
+    if not PYPFOPT_AVAILABLE:
+        missing_deps.append("PyPortfolioOpt")
+    
+    if not QUANTSTATS_AVAILABLE:
+        missing_deps.append("QuantStats")
+    
+    if not ARCH_AVAILABLE:
+        missing_deps.append("ARCH")
+    
+    if missing_deps:
+        st.warning(f"""
+        ⚠️ **Missing Dependencies Detected**
+        
+        The following packages are not installed:
+        - {', '.join(missing_deps)}
+        
+        **To install all dependencies, run:**
+        ```bash
+        pip install scikit-learn pypfopt quantstats arch
+        ```
+        
+        The application will run with built-in optimization algorithms.
+        """)
+    else:
+        st.success("✅ All dependencies are installed!")
 
 def display_welcome_screen():
     """Display welcome screen when no analysis is running"""
